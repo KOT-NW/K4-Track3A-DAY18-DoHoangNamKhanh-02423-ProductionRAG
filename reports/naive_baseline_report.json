@@ -1,0 +1,11 @@
+{
+  "aggregate": {
+    "faithfulness": 0.9,
+    "answer_relevancy": 0.8147216115478194,
+    "context_precision": 0.8583333332595833,
+    "context_recall": 0.8,
+    "engine": "ragas"
+  },
+  "num_questions": 20,
+  "failures": []
+}

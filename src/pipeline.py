@@ -29,10 +29,17 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    parents_map: dict[str, str] = {}
     for doc in docs:
+        src = doc["metadata"].get("source", "")
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        for p in parents:
+            parents_map[f"{src}:{p.metadata.get('parent_id')}"] = p.text
         for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
+            all_chunks.append({
+                "text": child.text,
+                "metadata": {**child.metadata, "parent_id": f"{src}:{child.parent_id}"},
+            })
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
@@ -50,6 +57,7 @@ def build_pipeline():
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
     search = HybridSearch()
     search.index(all_chunks)
+    search.parents_map = parents_map
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 4: Reranker (M3)
@@ -66,19 +74,27 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
 
-    from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
+    # Hierarchical: retrieve child → trả về PARENT (context đầy đủ hơn).
+    parents_map = getattr(search, "parents_map", {})
+    contexts: list[str] = []
+    for r in (reranked if reranked else results[:3]):
+        pid = r.metadata.get("parent_id") if isinstance(r.metadata, dict) else None
+        text = parents_map.get(pid, r.text)
+        if text not in contexts:
+            contexts.append(text)
+
+    from config import LLM_ENABLED
+    if LLM_ENABLED and contexts:
         try:
-            from openai import OpenAI
-            client = OpenAI()
+            from src.llm import chat
             context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+            answer = chat([
+                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Trả lời ngắn gọn, đúng trọng tâm. Nếu không có → nói 'Không tìm thấy.'"},
                 {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
-            answer = resp.choices[0].message.content
+            ], max_tokens=500)
+            if not answer:
+                answer = contexts[0]
         except Exception as e:
             print(f"  ⚠️  LLM generation failed: {e}", flush=True)
             answer = contexts[0]
